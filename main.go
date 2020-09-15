@@ -1,4 +1,4 @@
-// Copyright (c) 2012-2014 José Carlos Nieto, https://menteslibres.net/xiam
+// Copyright (c) 2012-today José Nieto, https://xiam.io
 //
 // Permission is hereby granted, free of charge, to any person obtaining
 // a copy of this software and associated documentation files (the
@@ -22,211 +22,159 @@
 package main
 
 import (
-	"database/sql"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"sync"
 
-	"github.com/xiam/hyperfox/proxy"
-	"github.com/xiam/hyperfox/tools/capture"
-	"github.com/xiam/hyperfox/tools/logger"
-	"upper.io/db"
-	"upper.io/db/sqlite"
+	"github.com/malfunkt/hyperfox/pkg/plugins/capture"
+	"github.com/malfunkt/hyperfox/pkg/plugins/logger"
+	"github.com/malfunkt/hyperfox/pkg/proxy"
+	"upper.io/db.v3"
 )
 
-const version = "0.9"
+const Version = "2.0.0"
 
 const (
-	defaultAddress           = `0.0.0.0`
-	defaultPort              = uint(1080)
-	defaultSSLPort           = uint(10443)
-	defaultCaptureCollection = `capture`
-	defaultDatabase          = `hyperfox-%05d.db`
-)
-
-const collectionCreateSQL = `CREATE TABLE "` + defaultCaptureCollection + `" (
-	"id" INTEGER PRIMARY KEY,
-	"origin" VARCHAR(255),
-	"method" VARCHAR(10),
-	"status" INTEGER,
-	"content_type" VARCHAR(50),
-	"content_length" INTEGER,
-	"host" VARCHAR(255),
-	"url" TEXT,
-	"scheme" VARCHAR(10),
-	"path" TEXT,
-	"header" TEXT,
-	"body" BLOB,
-	"request_header" TEXT,
-	"request_body" BLOB,
-	"date_start" VARCHAR(20),
-	"date_end" VARCHAR(20),
-	"time_taken" INTEGER
-)`
-
-var (
-	flagDatabase    = flag.String("d", "", "Path to database.")
-	flagAddress     = flag.String("l", defaultAddress, "Bind address.")
-	flagPort        = flag.Uint("p", defaultPort, "Port to bind to.")
-	flagSSLPort     = flag.Uint("s", defaultSSLPort, "Port to bind to (SSL mode).")
-	flagSSLCertFile = flag.String("c", "", "Path to root CA certificate.")
-	flagSSLKeyFile  = flag.String("k", "", "Path to root CA key.")
+	defaultAddress = `0.0.0.0`
+	defaultPort    = uint(1080)
+	defaultTLSPort = uint(10443)
 )
 
 var (
-	enableDatabaseSave = false
+	flagHelp        = flag.Bool("h", false, "Shows usage options.")
+	flagVersion     = flag.Bool("v", false, "Shows Hyperfox version.")
+	flagDatabase    = flag.String("db", "", "Path to SQLite database.")
+	flagAddress     = flag.String("addr", defaultAddress, "Bind address.")
+	flagPort        = flag.Uint("http", defaultPort, "Bind port (HTTP mode).")
+	flagTLSPort     = flag.Uint("https", defaultTLSPort, "Bind port (SSL/TLS mode). Requires --ca-cert and --ca-key.")
+	flagTLSCertFile = flag.String("ca-cert", "", "Path to root CA certificate.")
+	flagTLSKeyFile  = flag.String("ca-key", "", "Path to root CA key.")
+	flagDNS         = flag.String("dns", "", "Custom DNS server that bypasses the OS settings")
 )
 
 var (
-	sess db.Database
-	col  db.Collection
+	sess    db.Database
+	storage db.Collection
 )
 
-// dbsetup sets up the database.
-func dbsetup() error {
-	var err error
-	var databaseName string
-
-	if *flagDatabase == "" {
-		// Let's find an unused database file.
-		for i := 0; ; i++ {
-			databaseName = fmt.Sprintf(defaultDatabase, i)
-			if _, err := os.Stat(databaseName); err != nil {
-				// File does not exists (yet).
-				// And that's OK.
-				break
-			}
-		}
-	} else {
-		// Use the provided database name.
-		databaseName = *flagDatabase
-	}
-
-	// Attempting to open database.
-	if sess, err = db.Open(sqlite.Adapter, sqlite.ConnectionURL{Database: databaseName}); err != nil {
-		log.Fatalf(ErrDatabaseConnection.Error(), err)
-	}
-
-	// Collection lookup.
-	col, err = sess.Collection(defaultCaptureCollection)
-
-	if err == nil {
-		// Collection exists! Nothing else to do.
-		log.Printf("Using database %s.", databaseName)
-		return nil
-	}
-
-	log.Printf("Initializing database %s...", databaseName)
-
-	if err != db.ErrCollectionDoesNotExist {
-		// This error is different to a missing collection error.
-		log.Fatalf(ErrDatabaseConnection.Error(), err)
-	}
-
-	// Collection does not exists, let's create it.
-	if drv, ok := sess.Driver().(*sql.DB); ok {
-		// Execute CREATE TABLE.
-		if _, err = drv.Exec(collectionCreateSQL); err != nil {
-			log.Fatalf(ErrDatabaseConnection.Error(), err)
-		}
-		// Try pulling collection again.
-		if col, err = sess.Collection(defaultCaptureCollection); err != nil {
-			log.Fatalf(ErrDatabaseConnection.Error(), err)
-		}
-	}
-
-	return nil
-}
-
-// Parses flags and initializes Hyperfox tool.
 func main() {
-	var err error
-	var sslEnabled bool
 
-	// Banner.
-	log.Printf("Hyperfox v%s // https://hyperfox.org\n", version)
-	log.Printf("By José Carlos Nieto.\n\n")
-
-	// Parsing command line flags.
 	flag.Parse()
 
-	// Opening database.
-	if err = dbsetup(); err != nil {
-		log.Fatalf("db: %q", err)
+	if *flagHelp {
+		fmt.Printf("Usage: hyperfox [options]\n\n")
+		flag.PrintDefaults()
+		return
 	}
 
+	if *flagVersion {
+		fmt.Printf("%s\n", Version)
+		return
+	}
+
+	fmt.Printf("Hyperfox v%s, by José Nieto\n\n", Version)
+
+	// Opening database.
+	var err error
+	sess, err = initDB()
+	if err != nil {
+		log.Fatal("Failed to setup database: ", err)
+	}
 	defer sess.Close()
 
-	// Is SSL enabled?
-	if *flagSSLPort > 0 && *flagSSLCertFile != "" {
+	storage = sess.Collection(defaultCaptureCollection)
+	if !storage.Exists() {
+		log.Fatalf("No such table %q", defaultCaptureCollection)
+	}
+
+	// Is TLS enabled?
+	var sslEnabled bool
+	if *flagTLSPort > 0 && *flagTLSCertFile != "" {
 		sslEnabled = true
 	}
 
-	// User requested SSL mode.
+	// User requested TLS mode.
 	if sslEnabled {
-		if *flagSSLCertFile == "" {
+		if *flagTLSCertFile == "" {
 			flag.Usage()
-			log.Fatal(ErrMissingSSLCert)
+			log.Fatal("Missing root CA certificate")
 		}
 
-		if *flagSSLKeyFile == "" {
+		if *flagTLSKeyFile == "" {
 			flag.Usage()
-			log.Fatal(ErrMissingSSLKey)
+			log.Fatal("Missing root CA private key")
 		}
 
-		os.Setenv(proxy.EnvSSLCert, *flagSSLCertFile)
-		os.Setenv(proxy.EnvSSLKey, *flagSSLKeyFile)
+		os.Setenv(proxy.EnvTLSCert, *flagTLSCertFile)
+		os.Setenv(proxy.EnvTLSKey, *flagTLSKeyFile)
 	}
 
-	// Creatig proxy.
+	// Creating proxy.
 	p := proxy.NewProxy()
+
+	if *flagDNS != "" {
+		if err := p.SetCustomDNS(*flagDNS); err != nil {
+			log.Fatalf("unable to set custom DNS server: %v", err)
+		}
+	}
 
 	// Attaching logger.
 	p.AddLogger(logger.Stdout{})
 
 	// Attaching capture tool.
-	res := make(chan capture.Response, 256)
+	res := make(chan *capture.Record, 256)
 
 	p.AddBodyWriteCloser(capture.New(res))
 
 	// Saving captured data with a goroutine.
-	go func() {
-		for {
-			select {
-			case r := <-res:
-				if _, err := col.Append(r); err != nil {
-					log.Printf(ErrDatabaseError.Error(), err)
+	go func(res chan *capture.Record) {
+		for r := range res {
+			go func(r *capture.Record) {
+				id, err := storage.Insert(r)
+				if err != nil {
+					log.Printf("Failed to save to database: %s", err)
 				}
-			}
+				message := struct {
+					LastRecordID int64 `json:"last_record_id"`
+				}{id.(int64)}
+				if err := wsBroadcast(message); err != nil {
+					log.Print("wsBroadcast: ", err)
+				}
+			}(r)
 		}
-	}()
+	}(res)
 
-	if err = startServices(); err != nil {
-		log.Fatal("startServices:", err)
+	if *flagUI || *flagAPI {
+		if err = startServices(); err != nil {
+			log.Fatal("ui.Serve: ", err)
+		}
+		fmt.Println("")
 	}
 
-	fmt.Println("")
-
-	cerr := make(chan error)
+	var wg sync.WaitGroup
 
 	// Starting proxy servers.
-
-	go func() {
-		if err := p.Start(fmt.Sprintf("%s:%d", *flagAddress, *flagPort)); err != nil {
-			cerr <- err
-		}
-	}()
-
-	if sslEnabled {
+	if *flagPort > 0 {
+		wg.Add(1)
 		go func() {
-			if err := p.StartTLS(fmt.Sprintf("%s:%d", *flagAddress, *flagSSLPort)); err != nil {
-				cerr <- err
+			defer wg.Done()
+			if err := p.Start(fmt.Sprintf("%s:%d", *flagAddress, *flagPort)); err != nil {
+				log.Fatalf("Failed to bind to %s:%d (HTTP): %v", *flagAddress, *flagPort, err)
 			}
 		}()
 	}
 
-	err = <-cerr
+	if sslEnabled {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := p.StartTLS(fmt.Sprintf("%s:%d", *flagAddress, *flagTLSPort)); err != nil {
+				log.Fatalf("Failed to bind to %s:%d (TLS): %v", *flagAddress, *flagTLSPort, err)
+			}
+		}()
+	}
 
-	log.Fatalf(ErrBindFailed.Error(), err)
+	wg.Wait()
 }

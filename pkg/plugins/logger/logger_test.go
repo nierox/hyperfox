@@ -1,4 +1,4 @@
-// Copyright (c) 2012-2014 José Carlos Nieto, https://menteslibres.net/xiam
+// Copyright (c) 2012-today José Nieto, https://xiam.io
 //
 // Permission is hereby granted, free of charge, to any person obtaining
 // a copy of this software and associated documentation files (the
@@ -19,15 +19,16 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-package capture
+package logger
 
 import (
 	"bytes"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/xiam/hyperfox/proxy"
+	"github.com/malfunkt/hyperfox/pkg/proxy"
 )
 
 const listenHTTPAddr = `127.0.0.1:37400`
@@ -63,20 +64,25 @@ func newTestResponseWriter() *testResponseWriter {
 func TestListenHTTP(t *testing.T) {
 	px = proxy.NewProxy()
 
-	go func(t *testing.T) {
-		if err := px.Start(listenHTTPAddr); err != nil {
+	go func() {
+		time.Sleep(time.Millisecond * 100)
+		px.Stop()
+	}()
+
+	if err := px.Start(listenHTTPAddr); err != nil {
+		if !strings.Contains(err.Error(), "use of closed network connection") {
 			t.Fatal(err)
 		}
-	}(t)
-
-	time.Sleep(time.Millisecond * 100)
+	}
 }
 
-func TestWriteCloser(t *testing.T) {
+func TestLoggerInterface(t *testing.T) {
 	var req *http.Request
 	var err error
 
-	px.AddBodyWriteCloser(Capture{})
+	// Adding write closer that will receive all the data and then a closing
+	// instruction.
+	px.AddLogger(Stdout{})
 
 	urls := []string{
 		"http://golang.org/src/database/sql/",
@@ -86,7 +92,6 @@ func TestWriteCloser(t *testing.T) {
 	}
 
 	for i := range urls {
-
 		// Creating a response writer.
 		wri := newTestResponseWriter()
 

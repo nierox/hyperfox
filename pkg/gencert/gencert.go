@@ -1,4 +1,4 @@
-// Copyright (c) 2012-2014 José Carlos Nieto, https://menteslibres.net/xiam
+// Copyright (c) 2012-today José Nieto, https://xiam.io
 //
 // Permission is hereby granted, free of charge, to any person obtaining
 // a copy of this software and associated documentation files (the
@@ -19,8 +19,8 @@
 // OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-// Package otf provides SSL certificates on the fly.
-package otf
+// Package gencert generates SSL certificates for any host on the fly.
+package gencert
 
 import (
 	"crypto/rand"
@@ -30,13 +30,14 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
-	"fmt"
-	"log"
 	"math/big"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/idna"
 )
 
 const (
@@ -46,8 +47,8 @@ const (
 )
 
 var (
-	rootCACert = "../ssl/rootCA.crt"
-	rootCAKey  = "../ssl/rootCA.key"
+	rootCACert = "../../ca/rootCA.crt"
+	rootCAKey  = "../../ca/rootCA.key"
 )
 
 var (
@@ -64,99 +65,110 @@ func SetRootCAKey(s string) {
 	rootCAKey = s
 }
 
+func bigIntHash(n *big.Int) []byte {
+	h := sha1.New()
+	h.Write(n.Bytes())
+	return h.Sum(nil)
+}
+
 // CreateKeyPair creates a key pair for the given hostname on the fly.
-func CreateKeyPair(hostName string) (certFile string, keyFile string, err error) {
-
+func CreateKeyPair(commonName string) (certFile string, keyFile string, err error) {
 	mu.Lock()
-
 	defer mu.Unlock()
 
-	h := sha1.New()
-	h.Write([]byte(hostName))
-	hostHash := fmt.Sprintf("%x", h.Sum(nil))
+	commonName, err = idna.ToASCII(commonName)
+	if err != nil {
+		return "", "", err
+	}
+	commonName = strings.ToLower(commonName)
 
-	certFile = certDirectory + pathSeparator + hostHash + ".crt"
-	keyFile = certDirectory + pathSeparator + hostHash + ".key"
+	destDir := certDirectory + pathSeparator + commonName + pathSeparator
+
+	certFile = destDir + "cert.pem"
+	keyFile = destDir + "key.pem"
 
 	// Attempt to verify certs.
 	if _, err = tls.LoadX509KeyPair(certFile, keyFile); err == nil {
 		// Keys already in place
-		return
+		return certFile, keyFile, nil
 	}
 
-	log.Printf("Creating SSL certificate for %s...", hostName)
-
-	notBefore := time.Now()
-	notAfter := notBefore.Add(365 * 24 * time.Hour)
-
-	var serialNumber *big.Int
+	lastWeek := time.Now().AddDate(0, 0, -7)
+	notBefore := lastWeek
+	notAfter := lastWeek.AddDate(2, 0, 0)
 
 	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
-
-	if serialNumber, err = rand.Int(rand.Reader, serialNumberLimit); err != nil {
-		return
+	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	if err != nil {
+		return "", "", err
 	}
 
 	template := x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
-			Organization: []string{"Acme Co"},
-			CommonName:   hostName,
+			Organization:       []string{"Hyperfox Fake Certificates"},
+			OrganizationalUnit: []string{"Hyperfox Fake Certificates"},
+			CommonName:         commonName,
 		},
-		NotBefore:   notBefore,
-		NotAfter:    notAfter,
-		KeyUsage:    x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  false,
 	}
 
-	if ip := net.ParseIP(hostName); ip != nil {
+	if ip := net.ParseIP(commonName); ip != nil {
 		template.IPAddresses = append(template.IPAddresses, ip)
 	} else {
-		template.DNSNames = append(template.DNSNames, hostName)
+		template.DNSNames = append(template.DNSNames, commonName)
 	}
 
-	var rootCA tls.Certificate
-
-	if rootCA, err = tls.LoadX509KeyPair(rootCACert, rootCAKey); err != nil {
-		return
+	rootCA, err := tls.LoadX509KeyPair(rootCACert, rootCAKey)
+	if err != nil {
+		return "", "", err
 	}
 
 	if rootCA.Leaf, err = x509.ParseCertificate(rootCA.Certificate[0]); err != nil {
-		return
+		return "", "", err
 	}
+
+	template.AuthorityKeyId = rootCA.Leaf.SubjectKeyId
 
 	var priv *rsa.PrivateKey
-
 	if priv, err = rsa.GenerateKey(rand.Reader, rsaBits); err != nil {
-		return
+		return "", "", err
 	}
+	template.SubjectKeyId = bigIntHash(priv.N)
 
 	var derBytes []byte
-
 	if derBytes, err = x509.CreateCertificate(rand.Reader, &template, rootCA.Leaf, &priv.PublicKey, rootCA.PrivateKey); err != nil {
-		return
+		return "", "", err
 	}
 
-	if err = os.MkdirAll(certDirectory, 0755); err != nil {
-		return
+	if err = os.MkdirAll(destDir, 0755); err != nil {
+		return "", "", err
 	}
 
 	certOut, err := os.Create(certFile)
-
 	if err != nil {
-		return
+		return "", "", err
 	}
+	defer certOut.Close()
 
-	pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
-	certOut.Close()
+	if err := pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes}); err != nil {
+		return "", "", err
+	}
 
 	keyOut, err := os.OpenFile(keyFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
-		return
+		return "", "", err
+	}
+	defer keyOut.Close()
+
+	if err := pem.Encode(keyOut, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)}); err != nil {
+		return "", "", err
 	}
 
-	pem.Encode(keyOut, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
-	keyOut.Close()
-
-	return
+	return certFile, keyFile, nil
 }
